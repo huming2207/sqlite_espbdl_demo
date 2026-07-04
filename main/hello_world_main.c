@@ -14,15 +14,19 @@
 #include "esp_log.h"
 #include "esp_partition.h"
 #include "esp_timer.h"
+#include "esp_vfs_fat.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "sqlite3.h"
+#include "sqlite_esp_fs.h"
 #include "sqlite_espbdl.h"
 #include "wear_levelling.h"
 #include "freertos/task.h"
 
 #define SQLITE_PARTITION_LABEL "sqlite"
 #define SQLITE_DATABASE_NAME   "main.db"
+#define FATFS_MOUNT_PATH        "/fat"
+#define FATFS_DATABASE_PATH     FATFS_MOUNT_PATH "/data.db"
 #define API_BENCHMARK_SAMPLES  8
 #define API_BENCHMARK_BLOB_SIZE 512
 
@@ -476,7 +480,8 @@ static void api_timing_log(const api_timing_t *timing)
     api_timing_add(&(timing), api_started_us); \
 } while (0)
 
-static esp_err_t run_sqlite_api_benchmark(sqlite3 *db)
+static esp_err_t run_sqlite_api_benchmark(sqlite3 *db,
+                                          const char *backend_name)
 {
     api_timing_t prepare_insert = { .name = "sqlite3_prepare(insert)" };
     api_timing_t begin = { .name = "sqlite3_exec(BEGIN)" };
@@ -515,7 +520,8 @@ static esp_err_t run_sqlite_api_benchmark(sqlite3 *db)
         return ESP_FAIL;
     }
 
-    ESP_LOGI(TAG, "========== direct SQLite API timing ==========");
+    ESP_LOGI(TAG, "========== direct SQLite API timing: %s =========",
+             backend_name);
     sqlite3_stmt *statement = NULL;
     sqlite3_blob *blob = NULL;
     int rc = SQLITE_OK;
@@ -658,7 +664,8 @@ static esp_err_t run_sqlite_api_benchmark(sqlite3 *db)
     for (size_t i = 0; i < sizeof(all_timings) / sizeof(all_timings[0]); ++i) {
         api_timing_log(all_timings[i]);
     }
-    ESP_LOGI(TAG, "==============================================");
+    ESP_LOGI(TAG, "========== end SQLite API timing: %s ============",
+             backend_name);
     return ESP_OK;
 
 failed:
@@ -758,14 +765,85 @@ static esp_err_t verify_database(sqlite3 *db)
     return execute_sql(db, "PRAGMA wal_checkpoint(TRUNCATE)");
 }
 
-static esp_err_t run_sqlite_demo(void)
+static esp_err_t run_database_workload(const char *database_path,
+                                       const char *backend_name)
+{
+    esp_err_t result = ESP_FAIL;
+    sqlite3 *db = NULL;
+    sqlite3 *reader = NULL;
+
+    ESP_LOGI(TAG, "========== %s demo and benchmark ==========", backend_name);
+    int rc = sqlite3_open(database_path, &db);
+    if (sqlite_result(db, rc, "open database") != ESP_OK) goto cleanup;
+    sqlite3_busy_timeout(db, 3000);
+
+    /* Initialize page 1 in rollback mode before changing a brand-new FATFS
+     * database to WAL. Both backends use this exact sequence. */
+    if (create_schema(db) != ESP_OK ||
+        enable_wal(db) != ESP_OK ||
+        execute_sql(db,
+            "DELETE FROM telemetry;"
+            "DELETE FROM binary_assets;"
+            "DELETE FROM inventory") != ESP_OK ||
+        insert_demo_rows(db) != ESP_OK ||
+        insert_telemetry(db) != ESP_OK ||
+        run_json_queries(db) != ESP_OK ||
+        run_incremental_blob_demo(db) != ESP_OK ||
+        print_inventory(db, "inventory after CREATE/INSERT:") != ESP_OK ||
+        update_inventory(db) != ESP_OK ||
+        delete_inventory_row(db) != ESP_OK ||
+        print_inventory(db, "inventory after UPDATE/DELETE:") != ESP_OK ||
+        run_sqlite_api_benchmark(db, backend_name) != ESP_OK) {
+        goto cleanup;
+    }
+
+    rc = sqlite3_open(database_path, &reader);
+    if (sqlite_result(reader, rc, "open second connection") != ESP_OK) {
+        goto cleanup;
+    }
+    sqlite3_busy_timeout(reader, 3000);
+    if (execute_sql(reader, "PRAGMA locking_mode=NORMAL") != ESP_OK ||
+        print_inventory(reader,
+                        "same data through a second connection:") != ESP_OK) {
+        goto cleanup;
+    }
+
+    rc = sqlite3_close(reader);
+    if (rc != SQLITE_OK) {
+        ESP_LOGE(TAG, "failed to close second connection: rc=%d", rc);
+        goto cleanup;
+    }
+    reader = NULL;
+    if (verify_database(db) != ESP_OK) goto cleanup;
+    result = ESP_OK;
+
+cleanup:
+    if (reader && sqlite3_close(reader) != SQLITE_OK) result = ESP_FAIL;
+    if (db && sqlite3_close(db) != SQLITE_OK) result = ESP_FAIL;
+    ESP_LOGI(TAG, "========== %s %s ==========", backend_name,
+             result == ESP_OK ? "completed" : "failed");
+    return result;
+}
+
+static esp_err_t release_bdl(esp_blockdev_handle_t *handle, const char *name)
+{
+    if (!handle || *handle == ESP_BLOCKDEV_HANDLE_INVALID) return ESP_OK;
+    if (!(*handle)->ops || !(*handle)->ops->release) return ESP_ERR_INVALID_ARG;
+    esp_err_t result = (*handle)->ops->release(*handle);
+    if (result != ESP_OK) {
+        ESP_LOGE(TAG, "%s release failed: %s", name, esp_err_to_name(result));
+        return result;
+    }
+    *handle = ESP_BLOCKDEV_HANDLE_INVALID;
+    return ESP_OK;
+}
+
+static esp_err_t run_espbdl_demo(void)
 {
     esp_err_t result = ESP_FAIL;
     esp_blockdev_handle_t partition_bdl = ESP_BLOCKDEV_HANDLE_INVALID;
     esp_blockdev_handle_t wl_bdl = ESP_BLOCKDEV_HANDLE_INVALID;
     bool sqlite_port_initialized = false;
-    sqlite3 *db = NULL;
-    sqlite3 *reader = NULL;
 
     const esp_partition_t *partition = esp_partition_find_first(
         ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_ANY,
@@ -803,62 +881,10 @@ static esp_err_t run_sqlite_demo(void)
              (unsigned long long)database_capacity,
              (unsigned long long)wal_capacity);
 
-    int rc = sqlite3_open(SQLITE_DATABASE_NAME, &db);
-    if (sqlite_result(db, rc, "open database") != ESP_OK) {
-        result = ESP_FAIL;
-        goto cleanup;
-    }
-    sqlite3_busy_timeout(db, 3000);
-
-    if (enable_wal(db) != ESP_OK ||
-        create_schema(db) != ESP_OK ||
-        execute_sql(db,
-            "DELETE FROM telemetry;"
-            "DELETE FROM binary_assets;"
-            "DELETE FROM inventory") != ESP_OK ||
-        insert_demo_rows(db) != ESP_OK ||
-        insert_telemetry(db) != ESP_OK ||
-        run_json_queries(db) != ESP_OK ||
-        run_incremental_blob_demo(db) != ESP_OK ||
-        print_inventory(db, "inventory after CREATE/INSERT:") != ESP_OK ||
-        update_inventory(db) != ESP_OK ||
-        delete_inventory_row(db) != ESP_OK ||
-        print_inventory(db, "inventory after UPDATE/DELETE:") != ESP_OK ||
-        run_sqlite_api_benchmark(db) != ESP_OK) {
-        result = ESP_FAIL;
-        goto cleanup;
-    }
-
-    rc = sqlite3_open(SQLITE_DATABASE_NAME, &reader);
-    if (sqlite_result(reader, rc, "open second connection") != ESP_OK) {
-        result = ESP_FAIL;
-        goto cleanup;
-    }
-    sqlite3_busy_timeout(reader, 3000);
-    if (execute_sql(reader, "PRAGMA locking_mode=NORMAL") != ESP_OK ||
-        print_inventory(reader, "same data through a second connection:") != ESP_OK) {
-        result = ESP_FAIL;
-        goto cleanup;
-    }
-
-    if (sqlite3_close(reader) != SQLITE_OK) {
-        ESP_LOGE(TAG, "failed to close second connection");
-        reader = NULL;
-        result = ESP_FAIL;
-        goto cleanup;
-    }
-    reader = NULL;
-
-    if (verify_database(db) != ESP_OK) {
-        result = ESP_FAIL;
-        goto cleanup;
-    }
-    result = ESP_OK;
+    result = run_database_workload(SQLITE_DATABASE_NAME, "ESP-BDL");
 
 cleanup:
     bool release_partition_bdl = true;
-    if (reader) sqlite3_close(reader);
-    if (db) sqlite3_close(db);
     if (sqlite_port_initialized) {
         esp_err_t deinit_result = sqlite_espbdl_deinit();
         if (deinit_result != ESP_OK) {
@@ -867,30 +893,133 @@ cleanup:
             result = deinit_result;
             release_partition_bdl = false;
         }
-    } else if (wl_bdl != ESP_BLOCKDEV_HANDLE_INVALID && wl_bdl->ops->release) {
-        esp_err_t release_result = wl_bdl->ops->release(wl_bdl);
+    } else if (wl_bdl != ESP_BLOCKDEV_HANDLE_INVALID) {
+        esp_err_t release_result = release_bdl(&wl_bdl, "WL BDL");
         if (release_result != ESP_OK) {
-            ESP_LOGE(TAG, "WL BDL release failed: %s",
-                     esp_err_to_name(release_result));
             result = release_result;
             release_partition_bdl = false;
         }
     }
-    if (release_partition_bdl && partition_bdl != ESP_BLOCKDEV_HANDLE_INVALID &&
-        partition_bdl->ops->release) {
-        esp_err_t release_result = partition_bdl->ops->release(partition_bdl);
+    if (release_partition_bdl) {
+        esp_err_t release_result = release_bdl(&partition_bdl, "partition BDL");
         if (release_result != ESP_OK && result == ESP_OK) result = release_result;
+    }
+    return result;
+}
+
+static esp_err_t run_fatfs_demo(void)
+{
+    esp_err_t result = ESP_FAIL;
+    esp_blockdev_handle_t partition_bdl = ESP_BLOCKDEV_HANDLE_INVALID;
+    esp_blockdev_handle_t wl_bdl = ESP_BLOCKDEV_HANDLE_INVALID;
+    bool fatfs_mounted = false;
+    bool sqlite_port_initialized = false;
+
+    const esp_partition_t *partition = esp_partition_find_first(
+        ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_ANY,
+        SQLITE_PARTITION_LABEL);
+    if (!partition) {
+        ESP_LOGE(TAG, "data partition '%s' was not found", SQLITE_PARTITION_LABEL);
+        goto cleanup;
+    }
+
+    result = esp_partition_ptr_get_blockdev(partition, &partition_bdl);
+    if (result != ESP_OK) {
+        ESP_LOGE(TAG, "partition BDL creation for FATFS failed: %s",
+                 esp_err_to_name(result));
+        goto cleanup;
+    }
+    result = wl_get_blockdev(partition_bdl, &wl_bdl);
+    if (result != ESP_OK) {
+        ESP_LOGE(TAG, "WL BDL creation for FATFS failed: %s",
+                 esp_err_to_name(result));
+        goto cleanup;
+    }
+
+    const esp_vfs_fat_mount_config_t mount_config = {
+        .format_if_mount_failed = true,
+        .max_files = 8,
+        .allocation_unit_size = 0,
+    };
+    ESP_LOGI(TAG,
+             "mounting '%s' at %s; the raw-BDL contents will be formatted as FATFS",
+             SQLITE_PARTITION_LABEL, FATFS_MOUNT_PATH);
+    result = esp_vfs_fat_bdl_mount(FATFS_MOUNT_PATH, wl_bdl, &mount_config);
+    if (result != ESP_OK) {
+        ESP_LOGE(TAG, "FATFS format/mount failed: %s", esp_err_to_name(result));
+        goto cleanup;
+    }
+    fatfs_mounted = true;
+
+    uint64_t total_bytes = 0;
+    uint64_t free_bytes = 0;
+    result = esp_vfs_fat_info(FATFS_MOUNT_PATH, &total_bytes, &free_bytes);
+    if (result != ESP_OK) {
+        ESP_LOGE(TAG, "FATFS capacity query failed: %s", esp_err_to_name(result));
+        goto cleanup;
+    }
+    ESP_LOGI(TAG, "FATFS capacity: total=%llu free=%llu bytes",
+             (unsigned long long)total_bytes, (unsigned long long)free_bytes);
+
+    result = sqlite_fatfs_init();
+    if (result != ESP_OK) {
+        ESP_LOGE(TAG, "sqlite_fatfs_init failed: %s", esp_err_to_name(result));
+        goto cleanup;
+    }
+    sqlite_port_initialized = true;
+    result = run_database_workload(FATFS_DATABASE_PATH, "FATFS");
+
+cleanup:
+    bool can_unmount = true;
+    if (sqlite_port_initialized) {
+        esp_err_t deinit_result = sqlite_fatfs_deinit();
+        if (deinit_result != ESP_OK) {
+            ESP_LOGE(TAG, "sqlite_fatfs_deinit failed: %s",
+                     esp_err_to_name(deinit_result));
+            result = deinit_result;
+            can_unmount = false;
+        }
+    }
+    if (fatfs_mounted && can_unmount) {
+        esp_err_t unmount_result = esp_vfs_fat_bdl_unmount(FATFS_MOUNT_PATH,
+                                                            wl_bdl);
+        if (unmount_result != ESP_OK) {
+            ESP_LOGE(TAG, "FATFS unmount failed: %s",
+                     esp_err_to_name(unmount_result));
+            result = unmount_result;
+            can_unmount = false;
+        }
+    }
+    if (can_unmount) {
+        esp_err_t release_result = release_bdl(&wl_bdl, "FATFS WL BDL");
+        if (release_result != ESP_OK) {
+            result = release_result;
+            can_unmount = false;
+        }
+    }
+    if (can_unmount) {
+        esp_err_t release_result = release_bdl(&partition_bdl,
+                                               "FATFS partition BDL");
+        if (release_result != ESP_OK) result = release_result;
     }
     return result;
 }
 
 void app_main(void)
 {
-    esp_err_t result = run_sqlite_demo();
-    if (result == ESP_OK) {
-        ESP_LOGI(TAG, "SQLite ESP-BDL CRUD demo completed successfully");
-    } else {
-        ESP_LOGE(TAG, "SQLite ESP-BDL CRUD demo failed: %s",
-                 esp_err_to_name(result));
+    esp_err_t bdl_result = run_espbdl_demo();
+    if (bdl_result != ESP_OK) {
+        ESP_LOGE(TAG, "SQLite ESP-BDL demo failed: %s",
+                 esp_err_to_name(bdl_result));
+        return;
     }
+    ESP_LOGI(TAG, "SQLite ESP-BDL demo completed; starting FATFS comparison");
+
+    esp_err_t fatfs_result = run_fatfs_demo();
+    if (fatfs_result != ESP_OK) {
+        ESP_LOGE(TAG, "SQLite FATFS demo failed: %s",
+                 esp_err_to_name(fatfs_result));
+        return;
+    }
+    ESP_LOGI(TAG, "SQLite ESP-BDL and FATFS comparison completed successfully");
 }
