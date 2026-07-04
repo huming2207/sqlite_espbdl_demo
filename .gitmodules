@@ -1,0 +1,3 @@
+[submodule "components/sqlite_espbdl"]
+	path = components/sqlite_espbdl
+	url = https://github.com/huming2207/sqlite_espbdl
